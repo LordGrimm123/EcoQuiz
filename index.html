@@ -25,21 +25,27 @@
     <div id="root"></div>
 
     <script type="text/babel">
-        // Firebase configuration variables are provided by the canvas environment
-        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        // --- START CONFIGURATION ---
+        // These values have been updated with the keys you provided.
+        const firebaseConfig = {
+            apiKey: "AIzaSyDuJs7cd2U68cvAfZKXOxPpFpxz1y5yxUM",
+            authDomain: "ecoquiz-97deb.firebaseapp.com",
+            projectId: "ecoquiz-97deb",
+            storageBucket: "ecoquiz-97deb.firebasestorage.app",
+            messagingSenderId: "286196464817",
+            appId: "1:286196464817:web:1f3da94f00f3af6b54f690"
+        };
+        const geminiApiKey = "AIzaSyBW5ee9x84KbQ2XfSOuhRf9VhF24z1nm9o";
+        const customAppId = "eco-quiz-app-github"; // A unique ID for your app's data
+        // --- END CONFIGURATION ---
         
         // Firebase scripts are imported here
         const { initializeApp } = firebase;
         const { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } = firebase.auth;
         const { getFirestore, doc, setDoc, onSnapshot } = firebase.firestore;
         
-        // Initialize Firebase App
-        const app = initializeApp(firebaseConfig, "eco-quiz-app");
-        const auth = getAuth(app);
-        const db = getFirestore(app);
-
+        let app, auth, db;
+        
         // Helper function for exponential backoff on API calls
         const withExponentialBackoff = async (func, retries = 5, delay = 1000) => {
             for (let i = 0; i < retries; i++) {
@@ -77,12 +83,12 @@
 
             // Function to save game progress to Firestore
             const saveGameProgress = async (newCoins, newLevel, newTrees, newTimedCorrectAnswers) => {
-                if (!userId) {
-                    console.error("No user ID available for saving progress.");
+                if (!userId || !db) {
+                    console.error("No user ID or Firestore instance available for saving progress.");
                     return;
                 }
                 try {
-                    const docRef = doc(db, 'artifacts', appId, 'users', userId, 'game-progress', 'data');
+                    const docRef = doc(db, 'artifacts', customAppId, 'users', userId, 'game-progress', 'data');
                     await setDoc(docRef, {
                         coins: newCoins,
                         level: newLevel,
@@ -102,13 +108,12 @@
             React.useEffect(() => {
                 const initFirebase = async () => {
                     try {
-                        if (initialAuthToken) {
-                            await signInWithCustomToken(auth, initialAuthToken);
-                        } else {
-                            await signInAnonymously(auth);
-                        }
+                        app = initializeApp(firebaseConfig, customAppId);
+                        auth = getAuth(app);
+                        db = getFirestore(app);
+                        await signInAnonymously(auth);
                     } catch (error) {
-                        console.error("Firebase authentication error:", error);
+                        console.error("Firebase initialization or authentication error:", error);
                     }
                 };
                 initFirebase();
@@ -125,8 +130,8 @@
             }, []);
 
             React.useEffect(() => {
-                if (!isAuthReady || !userId) return;
-                const docRef = doc(db, 'artifacts', appId, 'users', userId, 'game-progress', 'data');
+                if (!isAuthReady || !userId || !db) return;
+                const docRef = doc(db, 'artifacts', customAppId, 'users', userId, 'game-progress', 'data');
                 const unsubscribe = onSnapshot(docRef, (docSnap) => {
                     if (docSnap.exists()) {
                         const data = docSnap.data();
@@ -172,8 +177,7 @@
                             }
                         }
                     };
-                    const apiKey = "";
-                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${geminiApiKey}`;
                     const response = await withExponentialBackoff(() => fetch(apiUrl, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
