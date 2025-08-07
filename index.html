@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Eco Quiz App</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React and ReactDOM CDNs -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- Babel for JSX transformation -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Font Awesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <!-- Inter Font -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // Firebase configuration variables are provided by the canvas environment
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // Firebase scripts are imported here
+        const { initializeApp } = firebase;
+        const { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } = firebase.auth;
+        const { getFirestore, doc, setDoc, onSnapshot } = firebase.firestore;
+        
+        // Initialize Firebase App
+        const app = initializeApp(firebaseConfig, "eco-quiz-app");
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+
+        // Helper function for exponential backoff on API calls
+        const withExponentialBackoff = async (func, retries = 5, delay = 1000) => {
+            for (let i = 0; i < retries; i++) {
+                try {
+                    return await func();
+                } catch (error) {
+                    if (i === retries - 1) throw error;
+                    await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)));
+                }
+            }
+        };
+
+        const App = () => {
+            const [userId, setUserId] = React.useState(null);
+            const [isAuthReady, setIsAuthReady] = React.useState(false);
+            const [view, setView] = React.useState('home');
+            const [coins, setCoins] = React.useState(0);
+            const [level, setLevel] = React.useState(1);
+            const [treesPlanted, setTreesPlanted] = React.useState(0);
+            const [showPlantTreeModal, setShowPlantTreeModal] = React.useState(false);
+            const [modalMessage, setModalMessage] = React.useState('');
+            const [showModal, setShowModal] = React.useState(false);
+            const [quizTimer, setQuizTimer] = React.useState(null);
+            const [timedQuizActive, setTimedQuizActive] = React.useState(false);
+            const [untimedQuizActive, setUntimedQuizActive] = React.useState(false);
+            const [currentQuiz, setCurrentQuiz] = React.useState([]);
+            const [currentQuestionIndex, setCurrentQuestionIndex] = React.useState(0);
+            const [score, setScore] = React.useState(0);
+            const [feedback, setFeedback] = React.useState(null);
+            const [timedCorrectAnswers, setTimedCorrectAnswers] = React.useState(0);
+            const [isLoading, setIsLoading] = React.useState(false);
+
+            const TREE_COST = 50;
+            const QUIZ_QUESTION_COUNT = 10;
+
+            // Function to save game progress to Firestore
+            const saveGameProgress = async (newCoins, newLevel, newTrees, newTimedCorrectAnswers) => {
+                if (!userId) {
+                    console.error("No user ID available for saving progress.");
+                    return;
+                }
+                try {
+                    const docRef = doc(db, 'artifacts', appId, 'users', userId, 'game-progress', 'data');
+                    await setDoc(docRef, {
+                        coins: newCoins,
+                        level: newLevel,
+                        treesPlanted: newTrees,
+                        timedCorrectAnswers: newTimedCorrectAnswers,
+                        updatedAt: new Date(),
+                    }, { merge: true });
+                    console.log("Game progress saved successfully!");
+                } catch (error) {
+                    console.error("Error saving game progress:", error);
+                    setModalMessage("Error saving progress. Please try again.");
+                    setShowModal(true);
+                }
+            };
+
+            // --- Auth and Data Fetching ---
+            React.useEffect(() => {
+                const initFirebase = async () => {
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (error) {
+                        console.error("Firebase authentication error:", error);
+                    }
+                };
+                initFirebase();
+                const unsubscribe = onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        setUserId(user.uid);
+                        setIsAuthReady(true);
+                    } else {
+                        setUserId(null);
+                        setIsAuthReady(true);
+                    }
+                });
+                return () => unsubscribe();
+            }, []);
+
+            React.useEffect(() => {
+                if (!isAuthReady || !userId) return;
+                const docRef = doc(db, 'artifacts', appId, 'users', userId, 'game-progress', 'data');
+                const unsubscribe = onSnapshot(docRef, (docSnap) => {
+                    if (docSnap.exists()) {
+                        const data = docSnap.data();
+                        setCoins(data.coins || 0);
+                        setLevel(data.level || 1);
+                        setTreesPlanted(data.treesPlanted || 0);
+                        setTimedCorrectAnswers(data.timedCorrectAnswers || 0);
+                    }
+                }, (error) => {
+                    console.error("Error fetching game progress:", error);
+                    setModalMessage("Error fetching progress. You may be offline.");
+                    setShowModal(true);
+                });
+                return () => unsubscribe();
+            }, [isAuthReady, userId]);
+
+            // Function to fetch new quiz questions from the Gemini API
+            const fetchNewQuestions = async (isTimed) => {
+                setIsLoading(true);
+                try {
+                    const prompt = `Generate a JSON array of ${QUIZ_QUESTION_COUNT} multiple-choice quiz questions about environmental science and ecology. Each question should have a 'question' string, an 'options' array of four strings, and an 'answer' string that exactly matches one of the options. Ensure the options are plausible but only one is correct. The questions should be suitable for a general audience. Example format: [{"question": "...", "options": ["...", "...", "...", "..."], "answer": "..."}]`;
+                    const payload = {
+                        contents: [{ parts: [{ text: prompt }] }],
+                        generationConfig: {
+                            responseMimeType: "application/json",
+                            responseSchema: {
+                                type: "ARRAY",
+                                items: {
+                                    type: "OBJECT",
+                                    properties: {
+                                        "question": { "type": "STRING" },
+                                        "options": {
+                                            "type": "ARRAY",
+                                            "items": { "type": "STRING" },
+                                            "minItems": 4,
+                                            "maxItems": 4
+                                        },
+                                        "answer": { "type": "STRING" }
+                                    },
+                                    "required": ["question", "options", "answer"],
+                                    "propertyOrdering": ["question", "options", "answer"]
+                                }
+                            }
+                        }
+                    };
+                    const apiKey = "";
+                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+                    const response = await withExponentialBackoff(() => fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    }));
+                    const result = await response.json();
+                    const rawJson = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+                    if (!rawJson) {
+                        throw new Error("API response is empty or malformed.");
+                    }
+                    const parsedQuestions = JSON.parse(rawJson);
+                    if (!Array.isArray(parsedQuestions) || parsedQuestions.length !== QUIZ_QUESTION_COUNT) {
+                        throw new Error("Invalid number of questions returned from API.");
+                    }
+                    const validatedQuestions = parsedQuestions.map(q => {
+                        const shuffledOptions = [...q.options].sort(() => Math.random() - 0.5);
+                        if (!shuffledOptions.includes(q.answer)) {
+                            console.error("Answer not found in options, adding it back.");
+                            shuffledOptions[Math.floor(Math.random() * 4)] = q.answer;
+                        }
+                        return { ...q, options: shuffledOptions };
+                    });
+                    setCurrentQuiz(validatedQuestions);
+                    setIsLoading(false);
+                    setView('quiz');
+                    setCurrentQuestionIndex(0);
+                    setScore(0);
+                    setFeedback(null);
+                    if (isTimed) {
+                        setTimedQuizActive(true);
+                        setQuizTimer(60);
+                    } else {
+                        setUntimedQuizActive(true);
+                        setQuizTimer(null);
+                    }
+                } catch (error) {
+                    console.error("Error fetching new questions:", error);
+                    setModalMessage("Failed to load new questions. Please try again.");
+                    setShowModal(true);
+                    setIsLoading(false);
+                    setView('home');
+                }
+            };
+
+            const startTimedQuiz = () => {
+                setTimedQuizActive(true);
+                setUntimedQuizActive(false);
+                fetchNewQuestions(true);
+            };
+
+            const startUntimedQuiz = () => {
+                setUntimedQuizActive(true);
+                setTimedQuizActive(false);
+                fetchNewQuestions(false);
+            };
+
+            const handleAnswer = (selectedOption) => {
+                const currentQuestion = currentQuiz[currentQuestionIndex];
+                if (selectedOption === currentQuestion.answer) {
+                    setScore(score + 1);
+                    setFeedback('correct');
+                } else {
+                    setFeedback('incorrect');
+                }
+                setTimeout(() => {
+                    setFeedback(null);
+                    if (currentQuestionIndex < currentQuiz.length - 1) {
+                        setCurrentQuestionIndex(currentQuestionIndex + 1);
+                    } else {
+                        if (timedQuizActive) {
+                            handleTimedQuizEnd(score + (selectedOption === currentQuestion.answer ? 1 : 0));
+                        } else {
+                            handleUntimedQuizEnd(score + (selectedOption === currentQuestion.answer ? 1 : 0));
+                        }
+                    }
+                }, 1000);
+            };
+
+            React.useEffect(() => {
+                if (timedQuizActive && quizTimer !== null && quizTimer > 0) {
+                    const timer = setTimeout(() => {
+                        setQuizTimer(quizTimer - 1);
+                    }, 1000);
+                    return () => clearTimeout(timer);
+                } else if (timedQuizActive && quizTimer === 0) {
+                    handleTimedQuizEnd(score);
+                }
+            }, [timedQuizActive, quizTimer, score]);
+
+            const handleTimedQuizEnd = (finalScore) => {
+                const newCoins = coins + (finalScore * 5);
+                const newTimedCorrectAnswers = timedCorrectAnswers + finalScore;
+                let newLevel = level;
+                const targetAnswersForNextLevel = 50 + (newLevel - 1) * 5;
+                if (newLevel === 1) {
+                    if (newTimedCorrectAnswers >= 50) {
+                        newLevel = 2;
+                        setModalMessage(`Congratulations! You've reached Level 2 and earned a badge!`);
+                        setShowModal(true);
+                    }
+                } else if (newTimedCorrectAnswers >= targetAnswersForNextLevel) {
+                    newLevel = newLevel + 1;
+                    setModalMessage(`Congratulations! You've reached Level ${newLevel} and earned a badge!`);
+                    setShowModal(true);
+                }
+                setCoins(newCoins);
+                setTimedCorrectAnswers(newTimedCorrectAnswers);
+                setLevel(newLevel);
+                saveGameProgress(newCoins, newLevel, treesPlanted, newTimedCorrectAnswers);
+                setTimedQuizActive(false);
+                setView('home');
+            };
+
+            const handleUntimedQuizEnd = (finalScore) => {
+                const newCoins = coins + (finalScore * 5);
+                setCoins(newCoins);
+                saveGameProgress(newCoins, level, treesPlanted, timedCorrectAnswers);
+                setUntimedQuizActive(false);
+                setView('home');
+                setModalMessage(`Quiz complete! You earned ${finalScore * 5} coins.`);
+                setShowModal(true);
+            };
+
+            const confirmPlantTree = () => {
+                if (coins >= TREE_COST) {
+                    const newCoins = coins - TREE_COST;
+                    const newTrees = treesPlanted + 1;
+                    setCoins(newCoins);
+                    setTreesPlanted(newTrees);
+                    saveGameProgress(newCoins, level, newTrees, timedCorrectAnswers);
+                    setShowPlantTreeModal(false);
+                    setModalMessage("You have successfully planted a virtual tree!");
+                    setShowModal(true);
+                } else {
+                    setModalMessage("You don't have enough coins to plant a tree!");
+                    setShowPlantTreeModal(false);
+                    setShowModal(true);
+                }
+            };
+
+            const Header = () => (
+                <header className="bg-green-700 text-white p-4 flex justify-between items-center rounded-t-xl shadow-lg">
+                    <div className="flex items-center space-x-2">
+                        <i className="fas fa-user-circle text-2xl"></i>
+                        <span className="text-sm font-semibold truncate max-w-[100px]">User: {userId}</span>
+                    </div>
+                    <div className="flex items-center space-x-4">
+                        <div className="flex items-center space-x-1">
+                            <i className="fas fa-bolt text-xl text-yellow-300"></i>
+                            <span className="text-lg font-bold">{coins}</span>
+                        </div>
+                        <div className="flex items-center space-x-1">
+                            <i className="fas fa-tree text-xl text-yellow-300"></i>
+                            <span className="text-lg font-bold">{treesPlanted}</span>
+                        </div>
+                    </div>
+                </header>
+            );
+
+            const Home = () => {
+                const targetAnswersForNextLevel = 50 + (level - 1) * 5;
+                const progressNeeded = targetAnswersForNextLevel - timedCorrectAnswers;
+                return (
+                    <div className="text-center p-8 flex flex-col items-center">
+                        <h1 className="text-4xl font-extrabold text-green-800 mb-2">Eco Quest</h1>
+                        <p className="text-xl text-gray-600 mb-8">Level: {level}</p>
+                        <div className="bg-white p-6 rounded-xl shadow-lg w-full max-w-md">
+                            <h2 className="text-2xl font-bold text-gray-800 mb-4">Level Progress</h2>
+                            <p className="text-lg text-gray-600 mb-2">Timed quiz correct answers: <span className="font-bold text-green-600">{timedCorrectAnswers}</span></p>
+                            {level === 1 && timedCorrectAnswers < 50 && (
+                                <p className="text-lg text-gray-600 mb-4">
+                                    Answer <span className="font-bold text-green-600">{50 - timedCorrectAnswers}</span> more questions correctly to reach Level 2!
+                                </p>
+                            )}
+                            {level > 1 && (
+                                <p className="text-lg text-gray-600 mb-4">
+                                    Answer <span className="font-bold text-green-600">{progressNeeded}</span> more questions correctly to reach Level {level + 1}!
+                                </p>
+                            )}
+                        </div>
+                        <div className="flex flex-col space-y-4 w-full mt-8 max-w-sm">
+                            <button
+                                onClick={startTimedQuiz}
+                                className="bg-green-600 hover:bg-green-700 text-white font-bold py-4 px-6 rounded-full shadow-lg transition-transform transform hover:scale-105"
+                            >
+                                Timed Quiz
+                            </button>
+                            <button
+                                onClick={startUntimedQuiz}
+                                className="bg-green-500 hover:bg-green-600 text-white font-bold py-4 px-6 rounded-full shadow-lg transition-transform transform hover:scale-105"
+                            >
+                                Untimed Quiz
+                            </button>
+                            <button
+                                onClick={() => setShowPlantTreeModal(true)}
+                                className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-4 px-6 rounded-full shadow-lg transition-transform transform hover:scale-105"
+                            >
+                                Plant a Tree ({TREE_COST} coins)
+                            </button>
+                        </div>
+                    </div>
+                );
+            };
+
+            const Quiz = () => {
+                const question = currentQuiz[currentQuestionIndex];
+                const isAnswered = feedback !== null;
+                if (isLoading) {
+                    return (
+                        <div className="flex items-center justify-center h-full">
+                            <p className="text-2xl font-bold text-green-700">Generating new questions...</p>
+                        </div>
+                    );
+                }
+                if (!question) {
+                    return null;
+                }
+                return (
+                    <div className="flex flex-col h-full p-6 text-center">
+                        {timedQuizActive && (
+                            <div className="text-xl font-bold text-red-500 mb-4">Time: {quizTimer}s</div>
+                        )}
+                        <div className="bg-white p-6 rounded-xl shadow-lg flex-grow flex flex-col justify-center">
+                            <h2 className="text-3xl font-bold text-gray-800 mb-6">{question.question}</h2>
+                            <div className="flex flex-col space-y-4">
+                                {question.options.map((option, index) => (
+                                    <button
+                                        key={index}
+                                        onClick={() => handleAnswer(option)}
+                                        disabled={isAnswered}
+                                        className={`
+                                            p-4 rounded-full text-lg font-semibold transition-colors duration-300 transform
+                                            ${isAnswered && option === question.answer ? 'bg-green-500 text-white' : ''}
+                                            ${isAnswered && option !== question.answer && feedback === 'incorrect' && option === currentQuiz[currentQuestionIndex].answer ? 'bg-green-500 text-white' : ''}
+                                            ${!isAnswered ? 'bg-gray-200 hover:bg-gray-300 text-gray-800 hover:scale-105' : ''}
+                                            shadow-md
+                                        `}
+                                    >
+                                        {option}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                        <button
+                            onClick={() => {
+                                setView('home');
+                                setTimedQuizActive(false);
+                                setUntimedQuizActive(false);
+                                setFeedback(null);
+                                setQuizTimer(null);
+                            }}
+                            className="mt-6 bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-full shadow-lg transition-transform transform hover:scale-105"
+                        >
+                            Quit Quiz
+                        </button>
+                    </div>
+                );
+            };
+
+            const Modal = ({ message, onConfirm }) => (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white p-8 rounded-xl shadow-2xl text-center max-w-sm w-full">
+                        <p className="text-xl font-semibold mb-6 text-gray-800">{message}</p>
+                        <button
+                            onClick={onConfirm}
+                            className="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-full transition-transform transform hover:scale-105"
+                        >
+                            Got it!
+                        </button>
+                    </div>
+                </div>
+            );
+
+            const PlantTreeModal = ({ message, onCancel, onConfirm }) => (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white p-8 rounded-xl shadow-2xl text-center max-w-sm w-full">
+                        <p className="text-xl font-semibold mb-6 text-gray-800">{message}</p>
+                        <div className="flex justify-around space-x-4">
+                            <button
+                                onClick={onConfirm}
+                                className="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-full transition-transform transform hover:scale-105"
+                            >
+                                Plant
+                            </button>
+                            <button
+                                onClick={onCancel}
+                                className="bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-full transition-transform transform hover:scale-105"
+                            >
+                                Cancel
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+            
+            if (!isAuthReady) {
+                return (
+                    <div className="min-h-screen flex items-center justify-center bg-gray-100 p-4">
+                        <div className="text-center">
+                            <p className="text-2xl font-bold text-green-700">Loading...</p>
+                        </div>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="min-h-screen bg-gray-100 p-4 flex items-center justify-center font-[Inter] text-gray-900">
+                    <div className="bg-gray-50 rounded-xl shadow-xl w-full max-w-2xl h-[90vh] flex flex-col">
+                        <Header />
+                        <main className="flex-grow flex flex-col justify-center p-4 overflow-auto">
+                            {view === 'home' && <Home />}
+                            {view === 'quiz' && <Quiz />}
+                        </main>
+                    </div>
+                    {showModal && <Modal message={modalMessage} onConfirm={() => setShowModal(false)} />}
+                    {showPlantTreeModal && (
+                        <PlantTreeModal
+                            message={`Are you sure you want to plant a tree for ${TREE_COST} coins?`}
+                            onCancel={() => setShowPlantTreeModal(false)}
+                            onConfirm={confirmPlantTree}
+                        />
+                    )}
+                </div>
+            );
+        };
+        
+        const container = document.getElementById('root');
+        const root = ReactDOM.createRoot(container);
+        root.render(<App />);
+
+    </script>
+    <!-- Firebase scripts -->
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+</body>
+</html>
